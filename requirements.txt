@@ -1,0 +1,13 @@
+streamlit
+sentence-transformers
+scikit-learn
+pandas
+numpy
+PyPDF2
+python-docx
+requests
+openai
+python-dotenv
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
