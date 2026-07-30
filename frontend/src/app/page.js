@@ -125,7 +125,7 @@ export default function Home() {
         formData.append("jd_text", batchJdText);
       }
 
-      const res = await fetch("${BACKEND_URL}/api/rank", {
+      const res = await fetch(`${BACKEND_URL}/api/rank`, {
         method: "POST",
         body: formData,
       });
@@ -172,7 +172,7 @@ export default function Home() {
         formData.append("jd_text", singleJdText);
       }
 
-      const res = await fetch("${BACKEND_URL}/api/rank", {
+      const res = await fetch(`${BACKEND_URL}/api/rank`, {
         method: "POST",
         body: formData,
       });
@@ -232,7 +232,7 @@ export default function Home() {
 
     try {
       const selectedObjList = gdriveFiles.filter((f) => selectedGdriveFiles.includes(f.id));
-      const res = await fetch("${BACKEND_URL}/api/gdrive/rank", {
+      const res = await fetch(`${BACKEND_URL}/api/gdrive/rank`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
