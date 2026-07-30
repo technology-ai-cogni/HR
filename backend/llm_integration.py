@@ -420,63 +420,26 @@ def parse_llm_response(response: str) -> Dict[str, Any]:
         return {"error": "Invalid JSON in response"}
 
 def call_llm(prompt: str) -> str:
-    """Make the LLM API call using Groq or OpenAI Chat Completions with error handling."""
+    """Make LLM API call using OpenAI Chat Completions API with error handling."""
     load_dotenv(override=True)
-    groq_api_key = os.getenv("GROQ_API_KEY")
     openai_api_key = os.getenv("OPENAI_API_KEY")
 
-    if groq_api_key:
-        client = openai.OpenAI(
-            api_key=groq_api_key,
-            base_url="https://api.groq.com/openai/v1"
+    if not openai_api_key:
+        raise Exception("OPENAI_API_KEY is not set in the environment or .env file.")
+
+    try:
+        client = openai.OpenAI(api_key=openai_api_key)
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,
         )
-        primary_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-        models_to_try = [
-            primary_model,
-            "llama-3.1-8b-instant",
-            "mixtral-8x7b-32768",
-            "gemma2-9b-it"
-        ]
-        # Preserve order without duplicates
-        seen = set()
-        models = [m for m in models_to_try if not (m in seen or seen.add(m))]
-
-        last_error = None
-        for model in models:
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.0,
-                )
-                return response.choices[0].message.content.strip()
-            except Exception as e:
-                last_error = e
-                if "429" in str(e) or "rate_limit" in str(e).lower():
-                    continue
-                else:
-                    raise Exception(f"Groq API error ({model}): {str(e)}")
-
-        raise Exception(f"Groq API error (all models rate-limited): {str(last_error)}")
-
-    elif openai_api_key:
-        try:
-            client = openai.OpenAI(api_key=openai_api_key)
-            model = os.getenv("OPENAI_MODEL", os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"))
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.0,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            raise Exception(f"OpenAI API error: {str(e)}")
-    else:
-        raise Exception("Neither GROQ_API_KEY nor OPENAI_API_KEY is set in the environment or .env file.")
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        raise Exception(f"OpenAI API error: {str(e)}")
 
 def generate_summary_lmstudio(prompt):
     # Retained for compatibility/reference
