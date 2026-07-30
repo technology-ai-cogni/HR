@@ -18,12 +18,15 @@ def clean_text_for_prompt(text):
     text = re.sub(r'\s+', ' ', text)
     text = re.sub(r'[^\w\s.,!?+#/\-@()]', '', text)
     text = ''.join(char for char in text if ord(char) >= 32)
-    return text.strip()
+    cleaned = text.strip()
+    return cleaned[:10000] if len(cleaned) > 10000 else cleaned
 
 RESUME_EXTRACTION_PROMPT = """You are an expert at parsing resumes with deep knowledge of tech industries. Extract ALL information in the following exact JSON format. Be thorough and comprehensive - extract every skill, every job entry, and every detail mentioned.
 
 {
     "candidate_name": "full name if mentioned",
+    "email": "email address if mentioned",
+    "phone_number": "phone number if mentioned",
     "job_title": "current/most recent title",
     "years_of_experience": 0,
     "certifications": ["cert1", "cert2"],
@@ -49,6 +52,7 @@ RESUME_EXTRACTION_PROMPT = """You are an expert at parsing resumes with deep kno
 
 CRITICAL INSTRUCTIONS for work_history:
 - Extract EVERY job position mentioned, in chronological order (most recent first).
+- Extract contact details ("email" and "phone_number") if visible.
 - For each position, extract the company name, role/title, dates, and skills used in that role.
 - Calculate duration_months as the approximate number of months worked there.
 - List specific technical skills and tools used in each role.
@@ -60,6 +64,58 @@ Resume Text:
 <<<{text}>>>
 
 Return ONLY the valid JSON object, no other text."""
+
+def extract_contact_info(text: str) -> Dict[str, str]:
+    """Robust regex extractor for email and phone numbers from resume text."""
+    if not text:
+        return {"email": "", "phone_number": ""}
+
+    email = ""
+    phone_number = ""
+
+    # 1. Email extraction
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    emails = re.findall(email_pattern, text)
+    if emails:
+        email = emails[0].strip()
+    else:
+        spaced_email = re.search(r'[a-zA-Z0-9._%+-]+\s*@\s*[a-zA-Z0-9.-]+\s*\.\s*[a-zA-Z]{2,}', text)
+        if spaced_email:
+            email = re.sub(r'\s+', '', spaced_email.group(0))
+
+    # 2. Phone number extraction
+    phone_patterns = [
+        r'\+?\d{1,3}[\s\-]?\(?\d{2,5}\)?[\s\-]?\d{3,5}[\s\-]?\d{3,5}',
+        r'\b\d{10}\b',
+        r'\b\d{5}[\s\-]\d{5}\b',
+        r'\b0\d{10}\b'
+    ]
+
+    # Try labeled phone first (e.g. Phone: +91 96700 53443, Mobile: 9876543210)
+    label_match = re.search(r'(?:phone|mobile|mob|tel|contact|cell)[\s:\-]*([\+\d\s\-\(\)]{8,20})', text, re.IGNORECASE)
+    if label_match:
+        candidate = label_match.group(1).strip()
+        digits = re.sub(r'[^\d+]', '', candidate)
+        if len(re.sub(r'[^\d]', '', digits)) >= 10:
+            phone_number = candidate
+
+    if not phone_number:
+        for pattern in phone_patterns:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                m_str = match.group(0).strip()
+                digits = re.sub(r'[^\d]', '', m_str)
+                # Ensure 10-13 digits and not a year like 2024, 2025, or zip code
+                if 10 <= len(digits) <= 13 and not digits.startswith(('202', '201', '199', '198')):
+                    phone_number = m_str
+                    break
+            if phone_number:
+                break
+
+    return {
+        "email": email,
+        "phone_number": phone_number
+    }
 
 def extract_structured_data(text: str, extraction_type: str) -> Dict[str, Any]:
     """Extract structured data with improved error handling and schema normalization."""
@@ -74,10 +130,23 @@ def extract_structured_data(text: str, extraction_type: str) -> Dict[str, Any]:
             parsed_data = _fallback_structure(extraction_type)
         else:
             parsed_data = _normalize_extracted(parsed_data, extraction_type)
+
+        # Force contact extraction regex fallback if email or phone_number is missing/empty
+        if extraction_type == "resume":
+            contacts = extract_contact_info(text)
+            if not parsed_data.get("email") or str(parsed_data.get("email")).strip() in ["", "N/A", "null", "None"]:
+                parsed_data["email"] = contacts["email"]
+            if not parsed_data.get("phone_number") or str(parsed_data.get("phone_number")).strip() in ["", "N/A", "null", "None"]:
+                parsed_data["phone_number"] = contacts["phone_number"]
+
         return parsed_data
     except Exception as e:
         print(f"Error in extraction: {str(e)}")
-        return {"error": str(e)}
+        fallback = {"error": str(e)}
+        if extraction_type == "resume":
+            contacts = extract_contact_info(text)
+            fallback.update(contacts)
+        return fallback
 
 
 def _fallback_structure(extraction_type: str) -> Dict[str, Any]:
@@ -85,6 +154,8 @@ def _fallback_structure(extraction_type: str) -> Dict[str, Any]:
     if extraction_type == "resume":
         return {
             "candidate_name": "",
+            "email": "",
+            "phone_number": "",
             "candidate_skills": [],
             "all_skills": [],
             "job_title": "",
@@ -110,6 +181,8 @@ def _normalize_extracted(data: Dict[str, Any], extraction_type: str) -> Dict[str
     """Ensure all expected keys exist and have correct types."""
     if extraction_type == "resume":
         data.setdefault("candidate_name", "")
+        data.setdefault("email", "")
+        data.setdefault("phone_number", "")
         data.setdefault("candidate_skills", data.get("all_skills", []))
         data.setdefault("all_skills", data.get("candidate_skills", []))
         data.setdefault("job_title", "")
@@ -151,40 +224,39 @@ def _normalize_extracted(data: Dict[str, Any], extraction_type: str) -> Dict[str
     return data
 
 def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
-    """Enhanced JSON extraction with more robust pattern matching"""
-    # Remove any markdown formatting
-    text = re.sub(r'```json\s*|\s*```', '', text)
-    
+    """Enhanced JSON extraction with robust pattern matching, handling think tags, markdown, and invalid characters."""
+    if not text or not isinstance(text, str):
+        return None
+
+    # Remove reasoning/think tags if present (e.g. DeepSeek/Qwen models)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+
+    # Remove markdown code block wrappers
+    text = re.sub(r'```(?:json)?\s*', '', text)
+    text = re.sub(r'```\s*$', '', text)
+    text = text.strip()
+
+    # 1. Direct JSON parse
     try:
-        # Try direct JSON parsing first
         return json.loads(text)
-    except json.JSONDecodeError:
-        # Try to find JSON-like structure with a simpler pattern
+    except Exception:
+        pass
+
+    # 2. Find outermost JSON braces { ... }
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        json_str = text[start:end + 1]
         try:
-            # Find content between outermost braces
-            matches = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
-            if matches:
-                json_str = matches.group(0)
-                return json.loads(json_str)
-            
-            # If no valid JSON found with regex, try finding the largest {...} block
-            start = text.find('{')
-            end = text.rfind('}')
-            if start != -1 and end != -1 and end > start:
-                json_str = text[start:end + 1]
-                return json.loads(json_str)
-        except (json.JSONDecodeError, AttributeError):
-            # If all attempts fail, try to clean the text more aggressively
-            cleaned = re.sub(r'[^\{\}\[\]\"\':\s\w\.,_-]', '', text)
+            return json.loads(json_str)
+        except Exception:
+            # Clean trailing commas (e.g., [1, 2,] or {"a": "b",})
+            cleaned = re.sub(r',\s*([\}\]])', r'\1', json_str)
             try:
-                start = cleaned.find('{')
-                end = cleaned.rfind('}')
-                if start != -1 and end != -1 and end > start:
-                    json_str = cleaned[start:end + 1]
-                    return json.loads(json_str)
-            except json.JSONDecodeError:
+                return json.loads(cleaned)
+            except Exception:
                 pass
-    
+
     return None
 
 JD_EXTRACTION_PROMPT = """You are an expert at parsing job descriptions. Extract ALL information in the following exact JSON format. Be thorough.
@@ -348,25 +420,63 @@ def parse_llm_response(response: str) -> Dict[str, Any]:
         return {"error": "Invalid JSON in response"}
 
 def call_llm(prompt: str) -> str:
-    """Make the actual LLM API call using OpenAI Chat Completions with error handling."""
-    try:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise Exception("OPENAI_API_KEY is not set in the environment or .env file.")
-        
-        client = openai.OpenAI(api_key=api_key)
-        model = os.getenv("OPENAI_MODEL", os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"))
-        
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.0,
+    """Make the LLM API call using Groq or OpenAI Chat Completions with error handling."""
+    load_dotenv(override=True)
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+
+    if groq_api_key:
+        client = openai.OpenAI(
+            api_key=groq_api_key,
+            base_url="https://api.groq.com/openai/v1"
         )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        raise Exception(f"OpenAI API error: {str(e)}")
+        primary_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        models_to_try = [
+            primary_model,
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it"
+        ]
+        # Preserve order without duplicates
+        seen = set()
+        models = [m for m in models_to_try if not (m in seen or seen.add(m))]
+
+        last_error = None
+        for model in models:
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.0,
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                last_error = e
+                if "429" in str(e) or "rate_limit" in str(e).lower():
+                    continue
+                else:
+                    raise Exception(f"Groq API error ({model}): {str(e)}")
+
+        raise Exception(f"Groq API error (all models rate-limited): {str(last_error)}")
+
+    elif openai_api_key:
+        try:
+            client = openai.OpenAI(api_key=openai_api_key)
+            model = os.getenv("OPENAI_MODEL", os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"))
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            raise Exception(f"OpenAI API error: {str(e)}")
+    else:
+        raise Exception("Neither GROQ_API_KEY nor OPENAI_API_KEY is set in the environment or .env file.")
 
 def generate_summary_lmstudio(prompt):
     # Retained for compatibility/reference

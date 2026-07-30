@@ -6,15 +6,16 @@ def compute_scores(resume_text, jd_text):
     jd_data = extract_structured_data(jd_text, extraction_type="jd")
 
     if "error" in resume_data or "error" in jd_data:
+        err_msg = resume_data.get("error") or jd_data.get("error")
         return {
             "skill": 0,
-            "skill_explanation": "Error in data extraction",
+            "skill_explanation": f"Error in data extraction: {err_msg}",
             "title": 0,
-            "title_explanation": "Error in data extraction",
+            "title_explanation": f"Error in data extraction: {err_msg}",
             "experience": 0,
-            "experience_explanation": "Error in data extraction",
+            "experience_explanation": f"Error in data extraction: {err_msg}",
             "overall": 0,
-            "overall_explanation": "Failed to extract necessary information",
+            "overall_explanation": f"Failed to extract necessary information: {err_msg}",
             "resume_data": resume_data,
             "jd_data": jd_data,
         }
