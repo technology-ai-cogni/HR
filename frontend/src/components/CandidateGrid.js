@@ -1,6 +1,6 @@
-"use client";
+import React, { useState, useEffect } from "react";
 
-import { useState } from "react";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
 const POSITIONS = [
   "Select Position...",
@@ -32,89 +32,128 @@ const POSITIONS = [
 ];
 
 export default function CandidateGrid({ candidates }) {
-  const [gridData, setGridData] = useState(
-    candidates.map((c) => {
+  const mapCandidatesToGrid = (cands) => {
+    return cands.map((c) => {
       const rData = c.scores?.resume_data || {};
-      const candTitle = rData.job_title || "";
-      
-      let defaultPos = "Select Position...";
-      if (candTitle) {
-        const titleLower = candTitle.toLowerCase();
-        for (const pos of POSITIONS.slice(1)) {
-          if (pos.toLowerCase().includes(titleLower) || titleLower.includes(pos.toLowerCase())) {
-            defaultPos = pos;
-            break;
-          }
+
+      let defaultPos = c.position || "Select Position...";
+      if (defaultPos === "Select Position..." && rData.job_title) {
+        const found = POSITIONS.find((p) => p.toLowerCase() === rData.job_title.toLowerCase());
+        if (found) {
+          defaultPos = found;
         }
       }
 
-      const llmEval = c.scores?.llm_evaluation || {};
-      const overallLlm = llmEval.overall_match?.score ?? Math.round((c.overall_score || 0) * 100);
-      const skillLlm = llmEval.skill_match?.score ?? Math.round((c.scores?.skill || 0) * 100);
-      const titleLlm = llmEval.title_match?.score ?? Math.round((c.scores?.title || 0) * 100);
-      const expLlm = llmEval.experience_match?.score ?? Math.round((c.scores?.experience || 0) * 100);
+      let verdict = c.hire_verdict || c.scores?.hire_recommendation || "No";
+      if (verdict !== "Yes") verdict = "No";
+
+      const reqExp = c.required_experience || c.scores?.required_experience || "0 Years";
+      const candExp = c.candidate_experience || c.scores?.candidate_experience || "0 Months";
 
       return {
+        id: c.id || null,
         rank: c.rank,
-        candidate_name: rData.candidate_name || c.file_name,
-        email: rData.email || "",
-        phone_number: rData.phone_number || "",
+        candidate_name: c.candidate_name || rData.candidate_name || c.file_name,
+        email: c.email || rData.email || "",
+        phone_number: c.phone_number || rData.phone_number || "",
         position: defaultPos,
         file_name: c.file_name,
-        hire_verdict: c.scores?.hire_recommendation || "N/A",
-        overall_score: overallLlm,
-        skill_score: skillLlm,
-        title_score: titleLlm,
-        exp_score: expLlm,
-        years_of_experience: rData.years_of_experience || 0,
-        matched_skills: (c.scores?.skill_matched || []).join(", "),
-        missing_skills: (c.scores?.skill_missing || []).join(", "),
-        hiring_stage: "",
-        remarks: "",
+        hire_verdict: verdict,
+        required_experience: reqExp,
+        candidate_experience: candExp,
+        hiring_stage: c.hiring_stage || "",
+        remarks: c.remarks || "",
         recommendation_reason: c.scores?.hire_reason || "",
+        resume_link: c.resume_link || c.scores?.resume_link || "",
         scores: c.scores
       };
-    })
-  );
+    });
+  };
 
-  const handleFieldChange = (index, field, value) => {
+  const [gridData, setGridData] = useState(() => mapCandidatesToGrid(candidates));
+
+  useEffect(() => {
+    setGridData(mapCandidatesToGrid(candidates));
+  }, [candidates]);
+
+  const handleFieldChange = async (index, field, value) => {
     const updated = [...gridData];
     updated[index][field] = value;
     setGridData(updated);
+
+    const candId = updated[index].id;
+    if (candId) {
+      try {
+        await fetch(`${BACKEND_URL}/api/candidates/${candId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ [field]: value }),
+        });
+      } catch (err) {
+        console.error(`Auto-save error for candidate ${candId}:`, err);
+      }
+    }
+  };
+
+  const handleDelete = async (index, candId) => {
+    if (!window.confirm("Are you sure you want to delete this candidate record?")) return;
+
+    if (candId) {
+      try {
+        await fetch(`${BACKEND_URL}/api/candidates/${candId}`, {
+          method: "DELETE",
+        });
+      } catch (err) {
+        console.error(`Delete error for candidate ${candId}:`, err);
+      }
+    }
+
+    setGridData((prev) => prev.filter((_, i) => i !== index));
   };
 
   const handleExportExcel = async () => {
     try {
-      const candidatesPayload = gridData.map((item) => ({
-        file_name: item.file_name,
-        overall_score: item.overall_score / 100,
-        position: item.position,
-        hiring_stage: item.hiring_stage,
-        remarks: item.remarks,
-        scores: item.scores
-      }));
+      const payload = {
+        candidates: gridData.map((row) => ({
+          Rank: row.rank,
+          "Candidate Name": row.candidate_name,
+          Email: row.email,
+          "Phone Number": row.phone_number,
+          Position: row.position,
+          "File Name": row.file_name,
+          Verdict: row.hire_verdict,
+          "Required Experience": row.required_experience,
+          "Candidate Experience": row.candidate_experience,
+          "Hiring Stage": row.hiring_stage,
+          Remarks: row.remarks,
+          "Recommendation Reason": row.recommendation_reason,
+          "Resume Link": row.resume_link,
+        })),
+      };
 
-      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
-      const res = await fetch(`${backendUrl}/api/export`, {
+      const res = await fetch(`${BACKEND_URL}/api/export`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ candidates: candidatesPayload })
+        body: JSON.stringify(payload),
       });
 
-      if (!res.ok) throw new Error("Failed to export Excel file.");
+      if (!res.ok) throw new Error("Export failed.");
 
       const blob = await res.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "candidate_rankings.xlsx";
+      a.download = `Candidate_Rankings_${new Date().toISOString().slice(0, 10)}.xlsx`;
       document.body.appendChild(a);
       a.click();
-      a.remove();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
     } catch (err) {
-      alert("Export failed: " + err.message);
+      alert("Failed to export Excel: " + err.message);
     }
   };
+
+  if (!gridData || gridData.length === 0) return null;
 
   return (
     <div className="glass-panel" style={{ marginTop: "24px" }}>
@@ -124,11 +163,11 @@ export default function CandidateGrid({ candidates }) {
             Candidate Evaluation Grid
           </h3>
           <p style={{ fontSize: "0.85rem", color: "#64748b", marginTop: "2px" }}>
-            Showing {gridData.length} evaluated candidate(s). Edit Position, Hiring Stage, and Remarks directly in the table.
+            Showing {gridData.length} evaluated candidate(s). Edits auto-sync with Google Sheets.
           </p>
         </div>
 
-        <button className="btn-success" onClick={handleExportExcel}>
+        <button className="btn-success" onClick={handleExportExcel} style={{ fontSize: "0.85rem", padding: "8px 16px" }}>
           Download Excel (.xlsx)
         </button>
       </div>
@@ -144,17 +183,17 @@ export default function CandidateGrid({ candidates }) {
               <th style={{ minWidth: "190px" }}>Position</th>
               <th>File Name</th>
               <th>Verdict</th>
-              <th>Overall</th>
-              <th>Skill</th>
-              <th>Title</th>
-              <th>Exp</th>
+              <th>Required Exp</th>
+              <th>Candidate Exp</th>
               <th style={{ minWidth: "150px" }}>Hiring Stage</th>
               <th style={{ minWidth: "180px" }}>Remarks</th>
+              <th>Resume Link</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody>
             {gridData.map((row, idx) => (
-              <tr key={idx}>
+              <tr key={row.id || idx}>
                 <td style={{ fontWeight: 800, color: "#2563eb" }}>#{row.rank}</td>
                 <td style={{ fontWeight: 600, color: "#0f172a" }}>{row.candidate_name}</td>
                 <td style={{ color: "#2563eb", fontWeight: 500 }}>{row.email || "-"}</td>
@@ -176,16 +215,13 @@ export default function CandidateGrid({ candidates }) {
                 <td style={{ color: "#64748b", fontSize: "0.8rem" }}>{row.file_name}</td>
                 <td>
                   <span className={`verdict-tag ${
-                    row.hire_verdict === "Yes" ? "verdict-yes" :
-                    row.hire_verdict === "Maybe" ? "verdict-maybe" : "verdict-no"
+                    row.hire_verdict === "Yes" ? "verdict-yes" : "verdict-no"
                   }`}>
                     {row.hire_verdict}
                   </span>
                 </td>
-                <td style={{ fontWeight: 800, color: "#059669" }}>{row.overall_score}%</td>
-                <td>{row.skill_score}%</td>
-                <td>{row.title_score}%</td>
-                <td>{row.exp_score}%</td>
+                <td style={{ color: "#475569", fontWeight: 600 }}>{row.required_experience}</td>
+                <td style={{ color: "#0f172a", fontWeight: 700 }}>{row.candidate_experience}</td>
                 <td>
                   <input
                     type="text"
@@ -205,6 +241,37 @@ export default function CandidateGrid({ candidates }) {
                     onChange={(e) => handleFieldChange(idx, "remarks", e.target.value)}
                     style={{ fontSize: "0.82rem", padding: "4px 8px" }}
                   />
+                </td>
+                <td>
+                  {row.resume_link ? (
+                    <a
+                      href={row.resume_link}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: "#2563eb", fontWeight: 700, fontSize: "0.82rem", textDecoration: "underline", whiteSpace: "nowrap" }}
+                    >
+                      View PDF ↗
+                    </a>
+                  ) : (
+                    <span style={{ color: "#94a3b8", fontSize: "0.8rem" }}>N/A</span>
+                  )}
+                </td>
+                <td>
+                  <button
+                    onClick={() => handleDelete(idx, row.id)}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: "#ef4444",
+                      fontWeight: 800,
+                      cursor: "pointer",
+                      fontSize: "1.1rem",
+                      padding: "2px 8px",
+                    }}
+                    title="Delete row"
+                  >
+                    ✕
+                  </button>
                 </td>
               </tr>
             ))}

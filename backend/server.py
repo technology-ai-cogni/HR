@@ -9,6 +9,19 @@ import pandas as pd
 from extraction import extract_text_from_file
 from matching_engine import compute_scores, summarize_candidate
 from app import create_ranking_dataframe, generate_download_file, POSITIONS
+from database import (
+    init_db,
+    save_candidate_evaluation,
+    get_all_candidates,
+    update_candidate_grid_fields,
+    delete_candidate_record
+)
+from gsheet_integration import (
+    init_gsheet_headers,
+    sync_candidates_to_gsheet,
+    fetch_candidates_from_gsheet,
+    update_gsheet_row_by_filename
+)
 
 app = FastAPI(title="Resume Analyser API", version="1.0")
 
@@ -21,6 +34,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def on_startup():
+    """Initialize SQLite database & Google Sheets headers on FastAPI startup."""
+    init_db()
+    init_gsheet_headers()
+
 
 class ExportRequest(BaseModel):
     candidates: List[dict]
@@ -30,6 +49,13 @@ class GDriveRankRequest(BaseModel):
     folder_id: str
     selected_files: List[dict]
     jd_text: str
+    target_position: Optional[str] = None
+
+
+class UpdateCandidateRequest(BaseModel):
+    position: Optional[str] = None
+    hiring_stage: Optional[str] = None
+    remarks: Optional[str] = None
 
 
 @app.get("/")
@@ -42,14 +68,132 @@ def get_positions():
     return {"positions": POSITIONS}
 
 
+@app.get("/api/candidates")
+def list_candidates():
+    """Fetch all saved candidate evaluations from SQLite database & auto-sync to Google Sheet."""
+    try:
+        candidates = get_all_candidates()
+        try:
+            sync_candidates_to_gsheet(candidates)
+        except Exception as sheet_err:
+            print(f"Auto Google Sheet sync error: {sheet_err}")
+        return {"status": "success", "candidates": candidates}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch candidates: {str(e)}")
+
+
+@app.get("/api/gsheet/sync")
+def sync_gsheet():
+    """Fetch latest candidate changes made directly in Google Sheets and sync to SQLite DB & Dashboard."""
+    try:
+        sheet_candidates = fetch_candidates_from_gsheet()
+        if sheet_candidates:
+            all_c = get_all_candidates()
+            for c in sheet_candidates:
+                if c.get("file_name"):
+                    matched = next((item for item in all_c if item["file_name"] == c["file_name"]), None)
+                    if matched:
+                        update_candidate_grid_fields(
+                            matched["id"],
+                            position=c.get("position"),
+                            hiring_stage=c.get("hiring_stage"),
+                            remarks=c.get("remarks")
+                        )
+
+        all_candidates = get_all_candidates()
+        sync_candidates_to_gsheet(all_candidates)
+        return {"status": "success", "candidates": all_candidates}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Google Sheet sync failed: {str(e)}")
+
+
+@app.get("/api/gsheet/worksheets")
+def get_worksheets():
+    """Fetch list of all available worksheet tabs in the Google Spreadsheet."""
+    try:
+        from gsheet_integration import get_available_worksheets
+        worksheets = get_available_worksheets()
+        return {"status": "success", "worksheets": worksheets}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch worksheets: {str(e)}")
+
+
+@app.get("/api/gsheet/live")
+def get_live_gsheet(worksheet: Optional[str] = None):
+    """Fetch live headers and rows directly from a specific Google Sheet tab."""
+    try:
+        from gsheet_integration import fetch_raw_gsheet_rows
+        headers, rows = fetch_raw_gsheet_rows(target_worksheet=worksheet)
+        sheet_id = os.getenv("GOOGLE_SHEET_ID", "")
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit" if sheet_id else ""
+        return {
+            "status": "success",
+            "sheet_id": sheet_id,
+            "sheet_url": sheet_url,
+            "active_worksheet": worksheet or os.getenv("GOOGLE_WORKSHEET_NAME", "Sheet1"),
+            "headers": headers,
+            "rows": rows
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch live Google Sheet data: {str(e)}")
+
+
+@app.put("/api/candidates/{candidate_id}")
+def update_candidate(candidate_id: int, req: UpdateCandidateRequest):
+    """Update candidate grid fields (position, hiring_stage, remarks) in SQLite & Google Sheet."""
+    try:
+        success = update_candidate_grid_fields(
+            candidate_id,
+            position=req.position,
+            hiring_stage=req.hiring_stage,
+            remarks=req.remarks
+        )
+        if not success:
+            raise HTTPException(status_code=404, detail="Candidate not found or no changes made.")
+
+        # Update Google Sheet cell in background/realtime
+        cand_list = get_all_candidates()
+        target = next((c for c in cand_list if c["id"] == candidate_id), None)
+        if target:
+            update_gsheet_row_by_filename(
+                target["file_name"],
+                position=req.position,
+                hiring_stage=req.hiring_stage,
+                remarks=req.remarks
+            )
+
+        return {"status": "success", "message": "Candidate updated in DB & Google Sheet"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update candidate: {str(e)}")
+
+
+@app.delete("/api/candidates/{candidate_id}")
+def delete_candidate(candidate_id: int):
+    """Delete a candidate record from SQLite database."""
+    try:
+        success = delete_candidate_record(candidate_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Candidate not found.")
+
+        # Re-sync Google Sheet after deletion
+        sync_candidates_to_gsheet(get_all_candidates())
+        return {"status": "success", "message": "Candidate deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete candidate: {str(e)}")
+
+
 @app.post("/api/rank")
 async def rank_resumes(
     resumes: List[UploadFile] = File(...),
     jd_text: Optional[str] = Form(None),
     jd_file: Optional[UploadFile] = File(None),
+    target_position: Optional[str] = Form(None),
 ):
     try:
-        # Determine JD Text
         final_jd_text = ""
         if jd_file:
             final_jd_text = extract_text_from_file(jd_file.file)
@@ -64,7 +208,6 @@ async def rank_resumes(
 
         all_scores = []
         for file in resumes:
-            # Wrap content in a NamedBytesIO so filename extension is available
             content = await file.read()
             file_obj = io.BytesIO(content)
             file_obj.name = file.filename
@@ -77,12 +220,28 @@ async def rank_resumes(
 
         results = []
         for rank, item in enumerate(ranked, 1):
-            results.append({
+            res_obj = {
                 "rank": rank,
                 "file_name": item[0],
                 "overall_score": item[1],
                 "scores": item[2]
-            })
+            }
+            if target_position and target_position.strip() and target_position.strip() != "Select Position...":
+                res_obj["position"] = target_position.strip()
+
+            try:
+                db_id = save_candidate_evaluation(res_obj)
+                res_obj["id"] = db_id
+            except Exception as db_err:
+                print(f"Database save error: {db_err}")
+
+            results.append(res_obj)
+
+        # Sync all candidates to Google Sheet
+        try:
+            sync_candidates_to_gsheet(get_all_candidates())
+        except Exception as sheet_err:
+            print(f"Google Sheet sync error: {sheet_err}")
 
         return {"status": "success", "total": len(results), "results": results}
 
@@ -96,14 +255,12 @@ async def export_excel(req: ExportRequest):
         if not req.candidates:
             raise HTTPException(status_code=400, detail="No candidates provided for export.")
 
-        # Reconstruct ranked_results tuple list for create_ranking_dataframe
         ranked_tuples = []
         for c in req.candidates:
             file_name = c.get("file_name", "candidate.pdf")
             overall = c.get("overall_score", 0.0)
             scores = c.get("scores", {})
 
-            # Overwrite position / hiring stage / remarks if user edited them in Next.js grid
             if "resume_data" not in scores:
                 scores["resume_data"] = {}
             if c.get("position"):
@@ -117,7 +274,6 @@ async def export_excel(req: ExportRequest):
 
         df = create_ranking_dataframe(ranked_tuples)
 
-        # Apply user edited fields directly into DataFrame if passed
         for idx, c in enumerate(req.candidates):
             if idx < len(df):
                 if c.get("position"):
@@ -163,19 +319,37 @@ async def gdrive_rank(req: GDriveRankRequest):
         all_scores = []
         for f in req.selected_files:
             file_obj = download_file_bytes(f["id"], f["name"])
+            resume_link = f.get("web_view_link") or getattr(file_obj, "web_view_link", "") or f"https://drive.google.com/file/d/{f['id']}/view"
             resume_text = extract_text_from_file(file_obj)
             scores = compute_scores(resume_text, req.jd_text)
-            all_scores.append((f["name"], scores["overall"], scores))
+            all_scores.append((f["name"], scores["overall"], scores, resume_link))
 
         ranked = sorted(all_scores, key=lambda x: x[1], reverse=True)
         results = []
         for rank, item in enumerate(ranked, 1):
-            results.append({
+            res_obj = {
                 "rank": rank,
                 "file_name": item[0],
                 "overall_score": item[1],
-                "scores": item[2]
-            })
+                "scores": item[2],
+                "resume_link": item[3]
+            }
+            if req.target_position and req.target_position.strip() and req.target_position.strip() != "Select Position...":
+                res_obj["position"] = req.target_position.strip()
+
+            try:
+                db_id = save_candidate_evaluation(res_obj)
+                res_obj["id"] = db_id
+            except Exception as db_err:
+                print(f"Database save error: {db_err}")
+
+            results.append(res_obj)
+
+        # Sync all candidates to Google Sheet
+        try:
+            sync_candidates_to_gsheet(get_all_candidates())
+        except Exception as sheet_err:
+            print(f"Google Sheet sync error: {sheet_err}")
 
         return {"status": "success", "total": len(results), "results": results}
     except Exception as e:

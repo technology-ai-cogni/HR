@@ -1,7 +1,28 @@
 from llm_integration import extract_structured_data, generate_summary, compare_skill_lists, skill_matches, evaluate_match
+from typing import Dict, Any, Optional, Tuple, List
+
+def format_experience_text(years_val: float, months_val: Optional[int] = None) -> str:
+    """Format exact experience into readable text like '1 Year 6 Months', '8 Months', '2 Years'."""
+    if months_val is not None and months_val > 0:
+        y = months_val // 12
+        m = months_val % 12
+    else:
+        y = int(years_val)
+        m = round((years_val - y) * 12)
+        if m >= 12:
+            y += 1
+            m = 0
+
+    if y == 0 and m == 0:
+        return "0 Months"
+    if y > 0 and m > 0:
+        return f"{y} Year{'s' if y > 1 else ''} {m} Month{'s' if m > 1 else ''}"
+    if y > 0:
+        return f"{y} Year{'s' if y > 1 else ''}"
+    return f"{m} Month{'s' if m > 1 else ''}"
 
 
-def compute_scores(resume_text, jd_text):
+def compute_scores(resume_text: str, jd_text: str) -> Dict[str, Any]:
     resume_data = extract_structured_data(resume_text, extraction_type="resume")
     jd_data = extract_structured_data(jd_text, extraction_type="jd")
 
@@ -16,8 +37,12 @@ def compute_scores(resume_text, jd_text):
             "experience_explanation": f"Error in data extraction: {err_msg}",
             "overall": 0,
             "overall_explanation": f"Failed to extract necessary information: {err_msg}",
+            "required_experience": "0 Years",
+            "candidate_experience": "0 Months",
             "resume_data": resume_data,
             "jd_data": jd_data,
+            "hire_recommendation": "No",
+            "hire_reason": f"Error extracting data: {err_msg}"
         }
 
     resume_skills = resume_data.get("all_skills") or resume_data.get("candidate_skills", [])
@@ -28,7 +53,7 @@ def compute_scores(resume_text, jd_text):
     skill_score = skill_result["score"]
 
     title_score = _compare_titles(resume_data.get("job_title", ""), jd_data.get("job_title", ""))
-    exp_score, exp_detail = _compare_experience_detailed(resume_data, jd_data)
+    exp_score, exp_detail, req_exp_years, cand_exp_years, req_exp_text, cand_exp_text = _compare_experience_detailed(resume_data, jd_data)
 
     overall = 0.5 * skill_score + 0.3 * title_score + 0.2 * exp_score
 
@@ -57,6 +82,10 @@ def compute_scores(resume_text, jd_text):
         "title_explanation": title_explanation,
         "experience": round(exp_score, 2),
         "experience_explanation": exp_detail,
+        "required_experience": req_exp_text,
+        "candidate_experience": cand_exp_text,
+        "required_exp_years": req_exp_years,
+        "candidate_exp_years": cand_exp_years,
         "overall": round(overall, 2),
         "overall_explanation": (
             f"Weighted: Skills ({skill_score * 0.5:.2f}) + "
@@ -78,45 +107,53 @@ def compute_scores(resume_text, jd_text):
     return scores
 
 
-def get_hire_recommendation(scores):
-    """Determine Yes/Maybe/No hire recommendation based on combined scores.
-    Returns (recommendation: str, reason: str)."""
+def get_hire_recommendation(scores: Dict[str, Any]) -> Tuple[str, str]:
+    """Determine binary Yes/No hire recommendation based on experience and skills.
+    MUST ONLY RETURN 'Yes' OR 'No'."""
+    cand_exp_years = scores.get("candidate_exp_years", 0)
+    req_exp_years = scores.get("required_exp_years", 0)
+    cand_exp_text = scores.get("candidate_experience", "0 Months")
+    req_exp_text = scores.get("required_experience", "0 Years")
+
+    # RULE 1: Experience Check (Hard Prerequisite)
+    # If candidate experience is less than required experience -> STRICT "No"!
+    if req_exp_years > 0 and cand_exp_years < req_exp_years:
+        reason = (
+            f"No — Experience criteria not met. Candidate has {cand_exp_text}, "
+            f"but JD requires at least {req_exp_text}."
+        )
+        return "No", reason
+
+    # RULE 2: Skills Match Check
     llm_eval = scores.get("llm_evaluation", {})
     overall_llm = llm_eval.get("overall_match", {}).get("score", 0)
-    skill_llm = llm_eval.get("skill_match", {}).get("score", 0)
-    exp_llm = llm_eval.get("experience_match", {}).get("score", 0)
     must_missing = scores.get("must_missing", [])
     matched_count = len(scores.get("skill_matched", []))
     total_required = len(scores.get("skill_missing", [])) + matched_count
 
+    if must_missing:
+        reason = (
+            f"No — Missing required essential skills: {', '.join(must_missing)}."
+        )
+        return "No", reason
+
     skill_ratio = matched_count / total_required if total_required else 0
 
-    if overall_llm >= 60 and skill_ratio >= 0.5 and not must_missing:
+    if overall_llm >= 55 and skill_ratio >= 0.4:
         reason = (
-            f"Strong match — {matched_count}/{total_required} skills matched, "
-            f"LLM score {overall_llm}/100, no must-have skills missing."
+            f"Yes — Candidate meets experience requirement ({cand_exp_text}) "
+            f"and matches {matched_count}/{total_required} preferred skills."
         )
         return "Yes", reason
 
-    if overall_llm >= 35 and skill_ratio >= 0.3:
-        reason = (
-            f"Partial match — {matched_count}/{total_required} skills matched, "
-            f"LLM score {overall_llm}/100"
-        )
-        if must_missing:
-            reason += f", but missing must-have: {', '.join(must_missing)}"
-        return "Maybe", reason
-
     reason = (
-        f"Weak match — {matched_count}/{total_required} skills matched, "
-        f"LLM score {overall_llm}/100"
+        f"No — Insufficient skill match ({matched_count}/{total_required} preferred skills matched, "
+        f"LLM score {overall_llm}/100)."
     )
-    if must_missing:
-        reason += f", missing must-have: {', '.join(must_missing)}"
     return "No", reason
 
 
-def summarize_candidate(resume_text, jd_text, scores):
+def summarize_candidate(resume_text: str, jd_text: str, scores: Dict[str, Any]) -> str:
     work_history = scores.get("work_history", [])
     work_history_str = ""
     if work_history:
@@ -138,27 +175,23 @@ Candidate Resume:
 Job Description:
 {jd_text}
 
-Computed Scores:
-- Skill Match Score: {scores.get('skill')}
-- Job Title Relevance Score: {scores.get('title')}
-- Experience Match Score: {scores.get('experience')}
-- Overall Match Score: {scores.get('overall')}
+Required Experience: {scores.get('required_experience')}
+Candidate Experience: {scores.get('candidate_experience')}
 
 Skills Matched: {', '.join(scores.get('skill_matched', []))}
 Skills Missing: {', '.join(scores.get('skill_missing', []))}
 {work_history_str}
 
-Please justify each score:
-1. Explain why the candidate's skills (or lack thereof) led to the Skill Match Score. Reference specific matched and missing skills.
-2. Explain how the candidate's job title aligns or does not align with the required job title.
-3. Explain the candidate's experience level. Reference their work history and progression.
-4. Summarize how the strengths and weaknesses combine to produce the overall score.
+Please justify the final decision:
+1. Explain why the candidate's skills led to the decision. Reference specific matched and missing skills.
+2. Explain how the candidate's experience level ({scores.get('candidate_experience')}) aligns with the required experience ({scores.get('required_experience')}).
+3. Final Verdict: {scores.get('hire_recommendation')} ({scores.get('hire_reason')})
 
 Provide your answer in detailed plain text."""
     return generate_summary(prompt)
 
 
-def _compare_titles(resume_title, jd_title):
+def _compare_titles(resume_title: str, jd_title: str) -> float:
     if not resume_title or not jd_title:
         return 0.3
 
@@ -181,13 +214,15 @@ def _compare_titles(resume_title, jd_title):
     return 0.3
 
 
-def _compare_experience_detailed(resume_data, jd_data):
+def _compare_experience_detailed(resume_data: Dict[str, Any], jd_data: Dict[str, Any]) -> Tuple[float, str, float, float, str, str]:
     work_history = resume_data.get("work_history", [])
-    jd_required = 0
+    jd_required = 0.0
     try:
         jd_required = float(jd_data.get("required_experience", 0))
     except (ValueError, TypeError):
         pass
+
+    req_exp_text = f"{int(jd_required)} Year{'s' if jd_required != 1 else ''}" if jd_required > 0 else "0 Years"
 
     total_months_from_history = sum(job.get("duration_months", 0) for job in work_history)
     try:
@@ -195,48 +230,31 @@ def _compare_experience_detailed(resume_data, jd_data):
     except (ValueError, TypeError):
         total_from_field = 0
 
-    actual_months = max(total_months_from_history, total_from_field)
-    actual_years = actual_months / 12
+    actual_months = int(max(total_months_from_history, total_from_field))
+    actual_years = actual_months / 12.0
+
+    cand_exp_text = format_experience_text(actual_years, actual_months)
 
     if jd_required == 0:
         score = 1.0
     else:
-        score = min(actual_years / jd_required, 1.2)
-        if score > 1.0:
-            score = 1.0
-
-    relevant_months = 0
-    if work_history:
-        all_jd_skills = set(jd_data.get("required_skills", []))
-        for job in work_history:
-            job_skills = set(s.lower() for s in job.get("skills_used", []))
-            jd_skills_lower = set(s.lower() for s in all_jd_skills)
-            if job_skills & jd_skills_lower:
-                relevant_months += job.get("duration_months", 0)
-
-    relevant_years = relevant_months / 12
+        score = min(actual_years / jd_required, 1.0)
 
     detail_parts = [
-        f"Candidate total experience: ~{actual_years:.1f} years "
+        f"Candidate total experience: {cand_exp_text} "
         f"(from {len(work_history)} role(s) in work history)",
-        f"Required: {jd_required:.0f} years",
+        f"Required experience: {req_exp_text}",
     ]
 
     if work_history:
         detail_parts.append("\nWork History (most recent first):")
         for i, job in enumerate(work_history, 1):
             months = job.get("duration_months", 0)
-            yrs = months / 12
+            dur_text = format_experience_text(months / 12.0, months)
             skills_str = ", ".join(job.get("skills_used", []))
             detail_parts.append(
                 f"  {i}. {job.get('company', 'Unknown')} — {job.get('role', 'N/A')} "
-                f"(~{yrs:.1f} years) Skills: {skills_str}"
+                f"({dur_text}) Skills: {skills_str}"
             )
 
-    if relevant_months > 0:
-        detail_parts.append(
-            f"\nRelevant domain experience: ~{relevant_years:.1f} years "
-            f"(roles using skills required by this JD)"
-        )
-
-    return score, "\n".join(detail_parts)
+    return score, "\n".join(detail_parts), jd_required, actual_years, req_exp_text, cand_exp_text

@@ -40,17 +40,17 @@ export default function Sidebar({ activeTab, setActiveTab }) {
           </button>
 
           <button
-            className={`nav-item ${activeTab === "single" ? "active" : ""}`}
-            onClick={() => setActiveTab("single")}
-          >
-            <span>Single Candidate Match</span>
-          </button>
-
-          <button
             className={`nav-item ${activeTab === "gdrive" ? "active" : ""}`}
             onClick={() => setActiveTab("gdrive")}
           >
             <span>Google Drive Import</span>
+          </button>
+
+          <button
+            className={`nav-item ${activeTab === "live" ? "active" : ""}`}
+            onClick={() => setActiveTab("live")}
+          >
+            <span>Live Sheet Data</span>
           </button>
         </nav>
       </div>
