@@ -31,9 +31,10 @@ const POSITIONS = [
   "Researcher"
 ];
 
-export default function CandidateGrid({ candidates }) {
+export default function CandidateGrid({ candidates, onClearGrid }) {
   const mapCandidatesToGrid = (cands) => {
-    return cands.map((c) => {
+    const totalCount = cands.length;
+    return cands.map((c, idx) => {
       const rData = c.scores?.resume_data || {};
 
       let defaultPos = c.position || "Select Position...";
@@ -52,7 +53,7 @@ export default function CandidateGrid({ candidates }) {
 
       return {
         id: c.id || null,
-        rank: c.rank,
+        rank: idx + 1,
         candidate_name: c.candidate_name || rData.candidate_name || c.file_name,
         email: c.email || rData.email || "",
         phone_number: c.phone_number || rData.phone_number || "",
@@ -137,19 +138,62 @@ export default function CandidateGrid({ candidates }) {
         body: JSON.stringify(payload),
       });
 
-      if (!res.ok) throw new Error("Export failed.");
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `Candidate_Rankings_${new Date().toISOString().slice(0, 10)}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        return;
+      }
+    } catch (err) {
+      console.warn("Backend Excel export endpoint notice:", err);
+    }
 
-      const blob = await res.blob();
+    // Client-side Fallback (Generates downloadable Excel/CSV file instantly)
+    try {
+      const headers = [
+        "Rank", "Candidate Name", "Email", "Phone Number", "Position",
+        "File Name", "Verdict", "Required Experience", "Candidate Experience",
+        "Hiring Stage", "Remarks", "Recommendation Reason", "Resume Link"
+      ];
+
+      const csvRows = [headers.join(",")];
+      for (const row of gridData) {
+        const values = [
+          row.rank,
+          `"${(row.candidate_name || "").replace(/"/g, '""')}"`,
+          `"${(row.email || "").replace(/"/g, '""')}"`,
+          `"${(row.phone_number || "").replace(/"/g, '""')}"`,
+          `"${(row.position || "").replace(/"/g, '""')}"`,
+          `"${(row.file_name || "").replace(/"/g, '""')}"`,
+          `"${(row.hire_verdict || "").replace(/"/g, '""')}"`,
+          `"${(row.required_experience || "").replace(/"/g, '""')}"`,
+          `"${(row.candidate_experience || "").replace(/"/g, '""')}"`,
+          `"${(row.hiring_stage || "").replace(/"/g, '""')}"`,
+          `"${(row.remarks || "").replace(/"/g, '""')}"`,
+          `"${(row.recommendation_reason || "").replace(/"/g, '""')}"`,
+          `"${(row.resume_link || "").replace(/"/g, '""')}"`,
+        ];
+        csvRows.push(values.join(","));
+      }
+
+      const csvContent = "\uFEFF" + csvRows.join("\n");
+      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `Candidate_Rankings_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.download = `Candidate_Rankings_${new Date().toISOString().slice(0, 10)}.csv`;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
-    } catch (err) {
-      alert("Failed to export Excel: " + err.message);
+    } catch (fallbackErr) {
+      alert("Failed to download file: " + fallbackErr.message);
     }
   };
 
@@ -167,9 +211,36 @@ export default function CandidateGrid({ candidates }) {
           </p>
         </div>
 
-        <button className="btn-success" onClick={handleExportExcel} style={{ fontSize: "0.85rem", padding: "8px 16px" }}>
-          Download Excel (.xlsx)
-        </button>
+        <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+          {onClearGrid && (
+            <button
+              type="button"
+              onClick={onClearGrid}
+              style={{
+                background: "#fef2f2",
+                border: "1px solid #fecaca",
+                color: "#dc2626",
+                fontSize: "0.85rem",
+                fontWeight: 700,
+                padding: "8px 16px",
+                borderRadius: "8px",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+                transition: "all 0.15s ease"
+              }}
+              onMouseEnter={(e) => e.currentTarget.style.background = "#fee2e2"}
+              onMouseLeave={(e) => e.currentTarget.style.background = "#fef2f2"}
+            >
+              🗑️ Clear Grid List
+            </button>
+          )}
+
+          <button className="btn-success" onClick={handleExportExcel} style={{ fontSize: "0.85rem", padding: "8px 16px" }}>
+            Download Excel (.xlsx)
+          </button>
+        </div>
       </div>
 
       <div className="table-container">
