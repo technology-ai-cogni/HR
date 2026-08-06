@@ -83,26 +83,47 @@ def get_gdrive_service():
 
 
 def list_files_in_folder(folder_id: str):
-    """Lists PDF and DOCX files in a Google Drive folder with web view links."""
+    """Lists subfolders, PDF, and DOCX files in a Google Drive folder using pagination (no 100 limit cap)."""
     try:
         service = get_gdrive_service()
         query = (
             f"'{folder_id}' in parents and trashed = false and ("
+            "mimeType = 'application/vnd.google-apps.folder' or "
             "mimeType = 'application/pdf' or "
-            "mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'"
+            "mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or "
+            "mimeType = 'application/msword'"
             ")"
         )
-        
-        results = service.files().list(
-            q=query,
-            pageSize=100,
-            fields="nextPageToken, files(id, name, mimeType, size, webViewLink)"
-        ).execute()
-        
-        files = results.get('files', [])
-        for f in files:
-            f['web_view_link'] = f.get('webViewLink') or f"https://drive.google.com/file/d/{f['id']}/view"
-        return files
+
+        all_files = []
+        page_token = None
+
+        while True:
+            results = service.files().list(
+                q=query,
+                pageSize=1000,
+                pageToken=page_token,
+                fields="nextPageToken, files(id, name, mimeType, size, webViewLink)",
+                orderBy="folder,name"
+            ).execute()
+
+            items = results.get('files', [])
+            for f in items:
+                is_folder = (f.get("mimeType") == "application/vnd.google-apps.folder")
+                all_files.append({
+                    "id": f.get("id"),
+                    "name": f.get("name"),
+                    "mimeType": f.get("mimeType"),
+                    "size": f.get("size", "0"),
+                    "web_view_link": f.get("webViewLink") or f"https://drive.google.com/file/d/{f.get('id')}/view",
+                    "is_folder": is_folder
+                })
+
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
+
+        return all_files
     except Exception as e:
         raise Exception(f"Google Drive Error: {str(e)}")
 

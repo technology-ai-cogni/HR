@@ -14,7 +14,8 @@ from database import (
     save_candidate_evaluation,
     get_all_candidates,
     update_candidate_grid_fields,
-    delete_candidate_record
+    delete_candidate_record,
+    clear_all_evaluations
 )
 from gsheet_integration import (
     init_gsheet_headers,
@@ -138,6 +139,41 @@ def get_live_gsheet(worksheet: Optional[str] = None):
         raise HTTPException(status_code=500, detail=f"Failed to fetch live Google Sheet data: {str(e)}")
 
 
+class ExportRequest(BaseModel):
+    candidates: List[Dict[str, Any]]
+
+
+@app.post("/api/export")
+def export_excel(req: ExportRequest):
+    """Export candidate evaluations or spreadsheet rows to a downloadable Excel (.xlsx) file."""
+    try:
+        from io import BytesIO
+        from fastapi.responses import StreamingResponse
+        import pandas as pd
+
+        if not req.candidates:
+            raise HTTPException(status_code=400, detail="No candidate data provided for export.")
+
+        df = pd.DataFrame(req.candidates)
+
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Candidate Evaluations")
+        output.seek(0)
+
+        headers = {
+            "Content-Disposition": "attachment; filename=Candidate_Rankings.xlsx",
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers=headers
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate Excel export: {str(e)}")
+
+
 @app.put("/api/candidates/{candidate_id}")
 def update_candidate(candidate_id: int, req: UpdateCandidateRequest):
     """Update candidate grid fields (position, hiring_stage, remarks) in SQLite & Google Sheet."""
@@ -169,6 +205,16 @@ def update_candidate(candidate_id: int, req: UpdateCandidateRequest):
         raise HTTPException(status_code=500, detail=f"Failed to update candidate: {str(e)}")
 
 
+@app.delete("/api/candidates")
+def clear_all_candidates():
+    """Clear all local candidate evaluation records from SQLite database cache. Does NOT touch Google Sheets."""
+    try:
+        clear_all_evaluations()
+        return {"status": "success", "message": "Cleared local candidate evaluation records."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear candidate records: {str(e)}")
+
+
 @app.delete("/api/candidates/{candidate_id}")
 def delete_candidate(candidate_id: int):
     """Delete a candidate record from SQLite database."""
@@ -186,12 +232,45 @@ def delete_candidate(candidate_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to delete candidate: {str(e)}")
 
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
+
+
+def _process_local_resume_worker(file_name: str, file_bytes: bytes, final_jd_text: str):
+    """Worker function to process text extraction & score evaluation for a local resume file."""
+    try:
+        file_obj = io.BytesIO(file_bytes)
+        file_obj.name = file_name
+        resume_text = extract_text_from_file(file_obj)
+        scores = compute_scores(resume_text, final_jd_text)
+        return (file_name, scores["overall"], scores, "")
+    except Exception as err:
+        print(f"Error parsing resume {file_name}: {err}")
+        return None
+
+
+def _process_gdrive_resume_worker(f_info: dict, final_jd_text: str):
+    """Worker function to process download, text extraction & score evaluation for a GDrive resume file."""
+    try:
+        from gdrive_integration import download_file_bytes
+        file_obj = download_file_bytes(f_info["id"], f_info["name"])
+        resume_link = f_info.get("web_view_link") or getattr(file_obj, "web_view_link", "") or f"https://drive.google.com/file/d/{f_info['id']}/view"
+        resume_text = extract_text_from_file(file_obj)
+        scores = compute_scores(resume_text, final_jd_text)
+        return (f_info["name"], scores["overall"], scores, resume_link)
+    except Exception as err:
+        print(f"Error parsing GDrive resume {f_info.get('name')}: {err}")
+        return None
+
+
 @app.post("/api/rank")
 async def rank_resumes(
-    resumes: List[UploadFile] = File(...),
+    resumes: List[UploadFile] = File(default=[]),
     jd_text: Optional[str] = Form(None),
     jd_file: Optional[UploadFile] = File(None),
     target_position: Optional[str] = Form(None),
+    gdrive_files_json: Optional[str] = Form(None),
 ):
     try:
         final_jd_text = ""
@@ -203,18 +282,36 @@ async def rank_resumes(
         if not final_jd_text:
             raise HTTPException(status_code=400, detail="Job Description text or file is required.")
 
-        if not resumes:
-            raise HTTPException(status_code=400, detail="At least one resume file must be uploaded.")
-
         all_scores = []
-        for file in resumes:
-            content = await file.read()
-            file_obj = io.BytesIO(content)
-            file_obj.name = file.filename
+        tasks = []
 
-            resume_text = extract_text_from_file(file_obj)
-            scores = compute_scores(resume_text, final_jd_text)
-            all_scores.append((file.filename, scores["overall"], scores))
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            if resumes:
+                for file in resumes:
+                    if not file.filename:
+                        continue
+                    content = await file.read()
+                    tasks.append(
+                        executor.submit(_process_local_resume_worker, file.filename, content, final_jd_text)
+                    )
+
+            if gdrive_files_json:
+                try:
+                    gdrive_list = json.loads(gdrive_files_json)
+                    for f in gdrive_list:
+                        tasks.append(
+                            executor.submit(_process_gdrive_resume_worker, f, final_jd_text)
+                        )
+                except Exception as gerr:
+                    print(f"Error parsing Google Drive JSON payload: {gerr}")
+
+            for future in as_completed(tasks):
+                res = future.result()
+                if res:
+                    all_scores.append(res)
+
+        if not all_scores:
+            raise HTTPException(status_code=400, detail="At least one candidate resume file or Google Drive file must be selected.")
 
         ranked = sorted(all_scores, key=lambda x: x[1], reverse=True)
 
@@ -224,7 +321,8 @@ async def rank_resumes(
                 "rank": rank,
                 "file_name": item[0],
                 "overall_score": item[1],
-                "scores": item[2]
+                "scores": item[2],
+                "resume_link": item[3] if len(item) > 3 else ""
             }
             if target_position and target_position.strip() and target_position.strip() != "Select Position...":
                 res_obj["position"] = target_position.strip()
@@ -309,20 +407,21 @@ async def gdrive_list(folder_id: str):
 @app.post("/api/gdrive/rank")
 async def gdrive_rank(req: GDriveRankRequest):
     try:
-        from gdrive_integration import download_file_bytes
-
         if not req.selected_files:
             raise HTTPException(status_code=400, detail="No Google Drive files selected.")
         if not req.jd_text:
             raise HTTPException(status_code=400, detail="Job Description text is required.")
 
         all_scores = []
-        for f in req.selected_files:
-            file_obj = download_file_bytes(f["id"], f["name"])
-            resume_link = f.get("web_view_link") or getattr(file_obj, "web_view_link", "") or f"https://drive.google.com/file/d/{f['id']}/view"
-            resume_text = extract_text_from_file(file_obj)
-            scores = compute_scores(resume_text, req.jd_text)
-            all_scores.append((f["name"], scores["overall"], scores, resume_link))
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(_process_gdrive_resume_worker, f, req.jd_text)
+                for f in req.selected_files
+            ]
+            for future in as_completed(futures):
+                res = future.result()
+                if res:
+                    all_scores.append(res)
 
         ranked = sorted(all_scores, key=lambda x: x[1], reverse=True)
         results = []

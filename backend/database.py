@@ -128,11 +128,11 @@ def save_candidate_evaluation(res: Dict[str, Any]) -> int:
     return inserted_id
 
 def get_all_candidates() -> List[Dict[str, Any]]:
-    """Retrieve all candidates stored in SQLite database."""
+    """Retrieve all candidates stored in SQLite database in natural chronological order (1, 2, 3...)."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT * FROM evaluations ORDER BY overall_score DESC, updated_at DESC;
+        SELECT * FROM evaluations ORDER BY id ASC;
     """)
     rows = cursor.fetchall()
     conn.close()
@@ -219,3 +219,12 @@ def delete_candidate_record(cand_id: int) -> bool:
     affected = cursor.rowcount > 0
     conn.close()
     return affected
+
+def clear_all_evaluations() -> bool:
+    """Clear all candidate evaluations from local SQLite database without affecting Google Sheets."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM evaluations;")
+    conn.commit()
+    conn.close()
+    return True
